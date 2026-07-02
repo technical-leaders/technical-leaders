@@ -22,13 +22,20 @@
 //
 // Credentials: reads Airtable/Drive over plain HTTPS. In the Claude build
 // environment these hosts are proxy-injected so NO key is needed. At Vercel (or
-// any real network) set AIRTABLE_API_KEY and a Google service-account token
-// (see .env.example). If the API calls fail (no creds / offline), the script
-// DEGRADES GRACEFULLY: it logs a clear warning and leaves the committed, already
-// scrubbed transcript artifacts in place so `npm run build` still succeeds off
-// the committed data — it never fails the build and never partially overwrites
-// good data.
+// any real network) the proxy is absent, so explicit credentials are used:
+//   - AIRTABLE_API_KEY: sent as `Authorization: Bearer <key>` on Airtable calls.
+//   - GOOGLE_SERVICE_ACCOUNT_EMAIL + GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY: a service
+//     account whose PEM key signs a short-lived JWT that is exchanged for an OAuth
+//     access token (drive.readonly), used as `Authorization: Bearer <token>` on
+//     the Drive export calls. See .env.example.
+// The auth headers are additive: when a var is absent the code falls back to the
+// keyless proxy path, so this same script works in BOTH environments. If the API
+// calls fail (no creds / offline), the script DEGRADES GRACEFULLY: it logs a
+// clear warning and leaves the committed, already scrubbed transcript artifacts
+// in place so `npm run build` still succeeds off the committed data — it never
+// fails the build and never partially overwrites good data.
 
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { TRANSCRIPTS_DIR } from './lib/office-hours-sessions.mjs';
@@ -83,8 +90,26 @@ const loadEnvValue = (key) => {
   }
 };
 
+// Normalize a PEM private key that arrives via an env var. Providers (Vercel
+// included) commonly store the multi-line PEM with the newlines escaped as the
+// two-character sequence `\n`; turn those back into real newlines so
+// crypto.createSign() accepts the key. Also strips any surrounding quotes.
+const normalizePrivateKey = (key) => {
+  if (!key) return null;
+  return key
+    .trim()
+    .replace(/^['"]|['"]$/g, '')
+    .replace(/\\n/g, '\n');
+};
+
 const AIRTABLE_API_KEY = loadEnvValue('AIRTABLE_API_KEY');
+// Legacy: a pre-minted Drive OAuth access token. Still honored if present, but
+// the preferred path is the service-account JWT flow below.
 const GOOGLE_ACCESS_TOKEN = loadEnvValue('GOOGLE_DRIVE_ACCESS_TOKEN');
+const GOOGLE_SA_EMAIL = loadEnvValue('GOOGLE_SERVICE_ACCOUNT_EMAIL');
+const GOOGLE_SA_PRIVATE_KEY = normalizePrivateKey(
+  loadEnvValue('GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY'),
+);
 const SINCE = loadEnvValue('OFFICE_HOURS_SINCE') || DEFAULT_SINCE;
 
 const args = process.argv.slice(2);
@@ -96,8 +121,84 @@ const force = args.includes('--force');
 const airtableHeaders = () =>
   AIRTABLE_API_KEY ? { Authorization: `Bearer ${AIRTABLE_API_KEY}` } : {};
 
-const driveHeaders = () =>
-  GOOGLE_ACCESS_TOKEN ? { Authorization: `Bearer ${GOOGLE_ACCESS_TOKEN}` } : {};
+// ---------------------------------------------------------------------------
+// Google service-account OAuth2 (JWT bearer) flow — no external deps, just
+// Node's built-in crypto. Signs a JWT with the service account's private key,
+// exchanges it for a short-lived access token scoped to drive.readonly, and
+// caches the token for the lifetime of this run. Only exercised when the SA env
+// vars are present; otherwise the Drive export falls back to the keyless proxy
+// path (or a legacy pre-minted GOOGLE_DRIVE_ACCESS_TOKEN).
+const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
+const base64url = (input) => Buffer.from(input).toString('base64url');
+
+/** Sign the OAuth2 assertion JWT for the service account. */
+const buildServiceAccountJwt = () => {
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const claims = {
+    iss: GOOGLE_SA_EMAIL,
+    scope: DRIVE_SCOPE,
+    aud: TOKEN_ENDPOINT,
+    iat: now,
+    exp: now + 3600,
+  };
+  const signingInput = `${base64url(JSON.stringify(header))}.${base64url(
+    JSON.stringify(claims),
+  )}`;
+  const signer = crypto.createSign('RSA-SHA256');
+  signer.update(signingInput);
+  signer.end();
+  const signature = signer.sign(GOOGLE_SA_PRIVATE_KEY, 'base64url');
+  return `${signingInput}.${signature}`;
+};
+
+// Cached access token for the run: undefined = not yet attempted, null = attempt
+// failed (fall back to keyless), string = usable Bearer token.
+let cachedDriveToken;
+
+/**
+ * Resolve the Drive Authorization header value for this run.
+ * Precedence: service-account JWT (if SA vars set) → legacy access token →
+ * keyless (null). On a token-mint failure, logs a warning once and returns null
+ * so the export falls back to the keyless path / graceful degradation.
+ */
+async function getDriveAccessToken() {
+  if (GOOGLE_SA_EMAIL && GOOGLE_SA_PRIVATE_KEY) {
+    if (cachedDriveToken !== undefined) return cachedDriveToken;
+    try {
+      const resp = await fetch(TOKEN_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          assertion: buildServiceAccountJwt(),
+        }),
+      });
+      if (!resp.ok) {
+        throw new Error(`token endpoint ${resp.status} ${resp.statusText}`);
+      }
+      const data = await resp.json();
+      if (!data.access_token) throw new Error('no access_token in response');
+      cachedDriveToken = data.access_token;
+      console.log('   🔑 Google service-account token minted for Drive export.');
+    } catch (err) {
+      console.warn(
+        `   ⚠️  Could not mint Google service-account token (${err.message}). ` +
+          `Falling back to keyless Drive export.`,
+      );
+      cachedDriveToken = null;
+    }
+    return cachedDriveToken;
+  }
+  // No SA creds: honor a legacy pre-minted token, else keyless.
+  return GOOGLE_ACCESS_TOKEN || null;
+}
+
+const driveHeaders = async () => {
+  const token = await getDriveAccessToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+};
 
 /** Pull every AI Office Hours interaction (handles Airtable pagination). */
 async function fetchInteractions() {
@@ -140,7 +241,7 @@ const extractDocId = (url) => {
 /** Export a Google Doc to plain text via the Drive v3 export endpoint. */
 async function exportTranscriptText(docId) {
   const url = `https://www.googleapis.com/drive/v3/files/${docId}/export?mimeType=text/plain`;
-  const resp = await fetch(url, { headers: driveHeaders() });
+  const resp = await fetch(url, { headers: await driveHeaders() });
   if (!resp.ok) {
     throw new Error(`Drive export ${resp.status} for doc ${docId}`);
   }
@@ -275,8 +376,14 @@ const writeJsonStable = (filePath, data) => {
 
 async function run() {
   fs.mkdirSync(TRANSCRIPTS_DIR, { recursive: true });
+  const driveAuthMode =
+    GOOGLE_SA_EMAIL && GOOGLE_SA_PRIVATE_KEY
+      ? 'service account'
+      : GOOGLE_ACCESS_TOKEN
+        ? 'access token'
+        : 'absent (proxy)';
   console.log(
-    `🎙️  Office-hours ingestion — since ${SINCE}, Airtable key: ${AIRTABLE_API_KEY ? 'present' : 'absent (proxy)'}${force ? ', --force' : ''}\n`,
+    `🎙️  Office-hours ingestion — since ${SINCE}, Airtable key: ${AIRTABLE_API_KEY ? 'present' : 'absent (proxy)'}, Drive auth: ${driveAuthMode}${force ? ', --force' : ''}\n`,
   );
 
   let interactions;
